@@ -60,21 +60,164 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    read_cost_per_m: float | None = None,
+) -> bool:
+    """Check if prompt caching saves net money given read frequencies.
+
+    In modern LLM pricing (e.g. Anthropic / Gemini), caching involves a write/storage
+    overhead. Caching pays off when savings from subsequent reads > write cost:
+      Break-even reads = write_cost / [read_cost * (1 - read_discount)].
+    """
+    if read_cost_per_m is None or read_cost_per_m <= 0:
+        read_cost_per_m = write_cost_per_m
+    savings_per_read = read_cost_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return False
+    be_reads = write_cost_per_m / savings_per_read
+    return avg_cache_reads >= be_reads
+
+
+def break_even_cache_reads(
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    read_cost_per_m: float | None = None,
+) -> float:
+    """Minimum average reads needed per prefix before caching yields net savings."""
+    if read_cost_per_m is None or read_cost_per_m <= 0:
+        read_cost_per_m = write_cost_per_m
+    savings_per_read = read_cost_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return float("inf")
+    return round(write_cost_per_m / savings_per_read, 2)
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    interruption_rate: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
+    Policy:
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    Enhanced with Extension 1:
+      - Accounts for GPU-specific interruption risk and commitment horizon.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+
+    # Extension 1: If interruption rate is excessively high, spot might not win
     if interruptible and hours_per_day < 24:
+        if interruption_rate is not None and interruption_rate > 0.35:
+            # High interruption volatility causes excessive rework
+            return "on_demand" if duty < be else "reserved"
         return "spot"
+
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def recommend_tier_advanced(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str = "H100",
+    job_days: int = 30,
+    spot_hr: float = 1.5,
+    on_demand_hr: float = 2.5,
+    reserved_1yr_hr: float = 2.0,
+    reserved_3yr_hr: float = 1.4,
+) -> dict:
+    """Extension 1 (Xuất sắc): Decision engine comparing Spot, 1yr Reserved, and 3yr Reserved.
+
+    Considers:
+      1. GPU-specific interruption rate (H100 ~ 5%, A10G/L4 ~ 8-10%)
+      2. Checkpoint overhead and rework cost
+      3. Commitment horizon: 3-year commitment is risky for short-lived workloads (<1 yr).
+    """
+    interruption_rates = {"H100": 0.04, "H200": 0.03, "A100": 0.05, "A10G": 0.08, "L4": 0.08, "B200": 0.05}
+    irate = interruption_rates.get(gpu_type, 0.06)
+
+    duty = max(0.0, hours_per_day) / 24.0
+    total_hours = hours_per_day * job_days
+
+    # Calculate costs under each strategy for the job duration
+    od_cost = total_hours * on_demand_hr
+
+    # Spot cost with checkpoint simulation
+    spot_sim = spot_checkpoint_cost(
+        job_hours=total_hours,
+        spot_hr=spot_hr,
+        on_demand_hr=on_demand_hr,
+        interrupt_rate=irate,
+        ckpt_overhead_frac=0.03,
+        rework_hours_per_interrupt=0.5,
+    )
+    spot_cost = spot_sim["spot_cost"]
+
+    # Reserved options
+    res_1yr_cost = total_hours * reserved_1yr_hr
+    res_3yr_cost = total_hours * reserved_3yr_hr
+
+    # Decision logic:
+    if interruptible and hours_per_day < 24 and spot_cost < min(od_cost, res_1yr_cost):
+        chosen_tier = "spot"
+        chosen_cost = spot_cost
+        rationale = f"Interruptible ({irate:.0%} interrupt rate), spot delivers lowest TCO with checkpointing."
+    elif duty >= 0.55:
+        if job_days >= 365:
+            chosen_tier = "reserved_3yr"
+            chosen_cost = res_3yr_cost
+            rationale = "High duty cycle (>=55%) and multi-year horizon: 3yr reserved maximizes discount (44%)."
+        else:
+            chosen_tier = "reserved_1yr" if res_1yr_cost < od_cost else "reserved_3yr"
+            chosen_cost = res_1yr_cost if chosen_tier == "reserved_1yr" else res_3yr_cost
+            rationale = f"High duty cycle (>=55%) but short horizon ({job_days}d): 1yr reserved minimizes commitment risk."
+    else:
+        chosen_tier = "on_demand"
+        chosen_cost = od_cost
+        rationale = f"Low duty cycle ({duty:.1%}) below break-even threshold (55%): on-demand avoids idle commitment waste."
+
+    savings_vs_od = max(0.0, od_cost - chosen_cost)
+    savings_pct = (savings_vs_od / od_cost * 100.0) if od_cost > 0 else 0.0
+
+    return {
+        "chosen_tier": chosen_tier,
+        "chosen_cost": round(chosen_cost, 2),
+        "on_demand_cost": round(od_cost, 2),
+        "savings_vs_od": round(savings_vs_od, 2),
+        "savings_pct": round(savings_pct, 1),
+        "rationale": rationale,
+        "spot_sim": spot_sim,
+    }
+
+
+def tier_recommendation_matrix() -> list[dict]:
+    """Generates the decision matrix across GPU Types x Duty Cycles x Interruptibility."""
+    matrix = []
+    duty_scenarios = [("Low (25%, 6h/d)", 6.0), ("Medium (50%, 12h/d)", 12.0), ("High (83%, 20h/d)", 20.0), ("24/7 (100%, 24h/d)", 24.0)]
+    for gtype in ["H100", "A100", "A10G", "L4"]:
+        for label, hpd in duty_scenarios:
+            for intr in [True, False]:
+                tier = recommend_tier(hpd, intr, gpu_type=gtype)
+                matrix.append({
+                    "gpu_type": gtype,
+                    "duty_label": label,
+                    "hours_per_day": hpd,
+                    "interruptible": intr,
+                    "recommended_tier": tier,
+                })
+    return matrix
 
 
 def spot_checkpoint_cost(
